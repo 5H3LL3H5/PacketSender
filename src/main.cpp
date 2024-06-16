@@ -15,6 +15,11 @@
     #include <QDesktopServices>
     #include <QTranslator>
     #include <QLibraryInfo>
+#if QT_VERSION > QT_VERSION_CHECK(6, 0, 0)
+    #include <QGuiApplication>
+    #include <QStyleHints>
+#endif
+
     #include "settings.h"
     #include "languagechooser.h"
 #endif
@@ -88,7 +93,7 @@ void myMessageOutputDisable(QtMsgType type, const QMessageLogContext &context, c
 
 #define OUTVAR(var)  o<< "\n" << # var << ":" << var ;
 #define OUTIF()  if(!quiet) o<< "\n"
-#define OUTPUT() outBuilder = outBuilder.trimmed(); outBuilder.append("\n"); out << outBuilder; outBuilder.clear();
+#define OUTPUT() outBuilder = outBuilder.trimmed(); outBuilder.append("\n"); out << outBuilder; out.flush(); outBuilder.clear();
 
 
 
@@ -149,6 +154,9 @@ int main(int argc, char *argv[])
         if (arg2.contains("-v")) {
             gatekeeper = false;
         }
+        if (arg2.contains("-l")) {
+            gatekeeper = false;
+        }
         if (arg2.contains("version")) {
             gatekeeper = false;
         }
@@ -193,6 +201,8 @@ int main(int argc, char *argv[])
         if (QSslSocket::supportsSsl()) {
             versionBuilder.append(" / SSL:");
             versionBuilder.append(QSslSocket::sslLibraryBuildVersionString());
+        } else {
+            versionBuilder.append(" / SSL library not found");
         }
 
         #ifdef GIT_CURRENT_SHA1
@@ -221,6 +231,14 @@ int main(int argc, char *argv[])
         QCommandLineOption pureAsciiOption(QStringList() << "A" << "ASCII", "Parse data-to-send as pure ascii (no \\xx translation).");
         parser.addOption(pureAsciiOption);
 
+
+        // Command line server mode
+        QCommandLineOption serverOption(QStringList() << "l" << "listen", "Listen instead of send. Use bind options to specify port/IP. Otherwise, dynamic/All.");
+        parser.addOption(serverOption);
+
+        // Command line server response
+        QCommandLineOption responseOption(QStringList() << "r" << "response", "Server mode response data in mixed-ascii. Macro supported.", "ascii");
+        parser.addOption(responseOption);
 
 
         // An option with a value
@@ -297,7 +315,6 @@ int main(int argc, char *argv[])
         parser.addPositionalArgument("port", "Destination port/POST data. Optional for saved packet.");
         parser.addPositionalArgument("data", "Data to send. Optional for saved packet.");
 
-
         if (argc < 2) {
             parser.showHelp();
             return 0;
@@ -330,6 +347,9 @@ int main(int argc, char *argv[])
 
         bool wol = parser.isSet(wolOption);
 
+        bool server = parser.isSet(serverOption);
+        QString response = parser.value(responseOption);
+        QDEBUGVAR(response);
         bool okbps = false;
         bool okrate = false;
         bool maxrate = parser.isSet(maxOption);
@@ -354,6 +374,7 @@ int main(int argc, char *argv[])
 
         if (sslNoError) ssl = true;
 
+
         QString name = parser.value(nameOption);
 
         QString httpMethod = parser.value(httpOption).trimmed().toUpper();
@@ -375,6 +396,7 @@ int main(int argc, char *argv[])
         if (argssize >= 1) {
             address = args[0];
         }
+
 
         if(wol) {
             QString targetMAC = parser.value(wolOption).trimmed().toUpper();
@@ -539,7 +561,7 @@ int main(int argc, char *argv[])
         }
 
 
-        if (!port && name.isEmpty() && !http) {
+        if (!port && name.isEmpty() && !http && !server) {
             OUTIF() << "Warning: Sending to port zero.";
         }
 
@@ -569,6 +591,68 @@ int main(int argc, char *argv[])
 
         QSettings settings(SETTINGSFILE, QSettings::IniFormat);
         bool translateMacroSend = settings.value("translateMacroSendCheck", true).toBool();
+
+
+        if(server) {
+            bool bindResult = false;
+            MainPacketReceiver * receiver = new MainPacketReceiver(nullptr);
+            if(!response.isEmpty()) {
+                Packet replyPacket;
+                QDEBUGVAR(response);
+                replyPacket.hexString = Packet::ASCIITohex(response);
+                receiver->responsePacket(replyPacket);
+                if(!replyPacket.hexString.isEmpty()) {
+                    OUTIF() << "Loading response packet.";
+
+                }
+            }
+            QString bindIP = "any";
+            if(!bindIPstr.isEmpty()) {
+                bindIP = bindIPstr;
+
+            }
+
+            QString bindmode = "";
+            if(udp) {
+                bindmode = "UDP";
+                QUdpSocket sock;
+                bindResult = receiver->initUDP(bindIP, bind);
+                bind = receiver->udpSocket->localPort();
+                bindIP = receiver->udpSocket->localAddress().toString();
+            } else {
+                if(tcp) {
+                    bindmode = "TCP";
+                }
+                if(ssl) {
+                    bindmode = "SSL";
+                }
+                bindResult = receiver->initSSL(bindIP, bind, ssl);
+                bind = receiver->tcpServer->serverPort();
+                bindIP = receiver->tcpServer->serverAddress().toString();
+            }
+
+            bindIP = bindIP.toUpper();
+            if(bindResult) {
+                OUTIF() << bindmode << " Server started on " << bindIP << ":" << bind;
+                OUTIF() << "Use ctrl+c to exit.";
+                OUTPUT();
+                a.exec();
+            } else {
+                OUTIF() << "Failed to bind " << bindmode << " " << bindIP << ":" << bind;
+                if(bind < 1024) {
+                    OUTIF() << "Note that lower port numbers may require admin/sudo";
+                }
+                OUTPUT();
+            }
+
+
+
+            OUTIF() << "Done with server mode. ";
+
+            OUTPUT();
+            return 0;
+        }
+
 
 
         //Create the packet to send.
@@ -687,6 +771,9 @@ int main(int argc, char *argv[])
         QDEBUGVAR(usdelay);
         QDEBUGVAR(translateMacroSend);
         QDEBUGVAR(maxrate);
+        QDEBUGVAR(server);
+        QDEBUGVAR(response);
+
 
 
         //NOW LETS DO THIS!
@@ -1058,25 +1145,7 @@ int main(int argc, char *argv[])
 
                 if (sock.hasPendingDatagrams()) {
 
-
-                    QHostAddress sender;
-                    int senderPort;
-
-                    QNetworkDatagram theDatagram = sock.receiveDatagram(10000000);
-                    QByteArray recvData = theDatagram.data();
-                    sender =  theDatagram.senderAddress();
-                    senderPort = theDatagram.senderPort();
-
-                    QString hexString = Packet::byteArrayToHex(recvData);
-                    if (quiet) {
-                        out << "\n" << hexString;
-                    } else {
-                        out << "\nFrom: " << sender.toString() << ", Port:" << senderPort;
-                        out << "\nResponse Time:" << QDateTime::currentDateTime().toString(DATETIMEFORMAT);
-                        out << "\nResponse HEX:" << hexString;
-                        out << "\nResponse ASCII:" << Packet::hexToASCII(hexString);
-                    }
-
+                    out << MainPacketReceiver::datagramOutput(sock.receiveDatagram(10000000), quiet);
                     out.flush();
                 }
             }
@@ -1173,6 +1242,7 @@ int main(int argc, char *argv[])
             QDEBUG() << QApplication::installTranslator(&translator_qt) << QApplication::installTranslator(&translator_qtbase) << QApplication::installTranslator(&translator) ;
         }
 
+
         QFile file_system(":/packetsender.css");
         QFile file_dark(":/qdarkstyle/style.qss");
 
@@ -1181,6 +1251,22 @@ int main(int argc, char *argv[])
         QSettings settings(SETTINGSFILE, QSettings::IniFormat);
         bool useDark = settings.value("darkModeCheck", true).toBool();
         QString styleSheet = "";
+
+#if QT_VERSION > QT_VERSION_CHECK(6, 5, 0)
+
+        QStyleHints * styleHints = QGuiApplication::styleHints();
+
+        auto colorScheme = styleHints->colorScheme();
+
+        if (colorScheme == Qt::ColorScheme::Dark ) {
+            QDEBUG() << "OS is set to dark mode";
+        }
+
+        if (colorScheme == Qt::ColorScheme::Light ) {
+            QDEBUG() << "OS is set to light mode";
+        }
+#endif
+
         if(useDark) {
             if (file_dark.open(QFile::ReadOnly)) {
                 styleSheet = QLatin1String(file_dark.readAll());
@@ -1194,6 +1280,7 @@ int main(int argc, char *argv[])
                 file_system.close();
             }
         }
+
 
         //panels_only = true;
         if(panels_only) {
